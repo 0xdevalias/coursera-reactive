@@ -54,13 +54,14 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   }
 
   def persist(
+    replyTo: ActorRef,
     key: String,
     valueOpt: Option[String],
     id: Long): Unit /*Future[Persisted]*/ = {
     //    implicit val timeout = Timeout(1.second)
 
     val msg = Persist(key, valueOpt, id)
-    persistAcks + (id -> msg)
+    persistAcks + (id -> (replyTo, msg))
 
     // This is a hack using a parallel redundancy pattern because I cbf doing it better
     persister ! msg
@@ -87,7 +88,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
 
     updateKV(key, valueOpt) // Is this seriously right..? Test Step4 Line46 seems to say we should.. but ignoring persistence seems illogical..
 
-    persist(key, valueOpt, id)
+    persist(replyTo, key, valueOpt, id)
     //    onComplete {
     //      case Success(s) => success
     //      case Failure(e) => ()
@@ -113,17 +114,20 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
     //    }
     //    val replicateF = replicate(key, valueOpt, id)
 
+    persist(replyTo, key, valueOpt, id)
+
     val curReplicators = replicators
+    if (curReplicators.nonEmpty) {
+      curReplicators foreach { _ ! Replicate(key, valueOpt, id) }
 
-    persist(key, valueOpt, id)
-    curReplicators foreach { _ ! Replicate(key, valueOpt, id) }
+      val scheduledFail = context.system.scheduler.scheduleOnce(FiniteDuration(1, SECONDS)) {
+        acks = acks - id
+        persistAcks = persistAcks - id
+        replyTo ! OperationFailed(id)
+      }
 
-    val scheduledFail = context.system.scheduler.scheduleOnce(FiniteDuration(1, SECONDS)) {
-      acks = acks - id
-      replyTo ! OperationFailed(id)
+      acks = acks + (id -> (scheduledFail, false, replyTo, curReplicators))
     }
-
-    acks = acks + (id -> (scheduledFail, false, replyTo, curReplicators))
 
     //    persistF onComplete { s => log.info("[persistOperation::persistF] {}", s) }
     //    replicateF onComplete { s => log.info("[persistOperation::replicateF] {}", s) }
@@ -164,7 +168,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   //    //    Future.sequence(responses)
   //  }
 
-  var persistAcks = Map.empty[Long, Persist]
+  var persistAcks = Map.empty[Long, (ActorRef, Persist)]
   var acks = Map.empty[Long, (Cancellable, Boolean, ActorRef, Set[ActorRef])]
 
   var expectedSeq = 0L
@@ -216,16 +220,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor with
   def persisting: Receive = {
     case Persisted(key, id) => {
       for {
-        p <- persistAcks.get(id)
-        (cancel, persisted, replyTo, remainingReplications) <- acks.get(id)
+        (replyTo, p) <- persistAcks.get(id)
       } yield {
         updateKV(p.key, p.valueOption)
-        if (remainingReplications.isEmpty) {
-          cancel.cancel()
-          acks - id
-          replyTo ! OperationAck(id)
-        } else {
-          acks = acks.updated(id, (cancel, true, replyTo, remainingReplications))
+
+        acks.get(id) match {
+          case None => replyTo ! OperationAck(id)
+          case Some((cancel, persisted, replyTo, remainingReplications)) => {
+            if (remainingReplications.isEmpty) {
+              cancel.cancel()
+              acks - id
+              replyTo ! OperationAck(id)
+            } else {
+              acks = acks.updated(id, (cancel, true, replyTo, remainingReplications))
+            }
+          }
         }
       }
     }
